@@ -77,6 +77,10 @@ Event Handler Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: DebouncedEventHandler
+   :members:
+   :show-inheritance:
+
 """
 
 from __future__ import annotations
@@ -84,6 +88,8 @@ from __future__ import annotations
 import logging
 import os.path
 import re
+import threading
+import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -509,6 +515,137 @@ class LoggingEventHandler(FileSystemEventHandler):
         super().on_opened(event)
 
         self.logger.info("Opened file: %s", event.src_path)
+
+
+class DebouncedEventHandler(FileSystemEventHandler):
+    """Wraps another event handler and coalesces bursts of duplicate events.
+
+    Events are grouped by ``(event_type, is_directory, src_path, dest_path)``:
+    file and directory events are coalesced separately, and moved events only
+    merge when both their source and destination paths match.  Within a quiet
+    window of ``delay`` seconds, a single event per group is forwarded to the
+    wrapped handler: the first one (``mode="first"``) or the most recent one
+    (``mode="last"``, the default).  Each new event in a group restarts the
+    quiet window.
+
+    :param handler:
+        The wrapped handler that receives the debounced events.
+    :type handler:
+        :class:`FileSystemEventHandler`
+    :param delay:
+        The quiet period in seconds.  ``0`` disables debouncing and forwards
+        events synchronously, without starting any thread.
+    :type delay:
+        ``float``
+    :param mode:
+        ``"first"`` to keep the first event of a burst, ``"last"`` to keep
+        the most recent one.
+    :type mode:
+        ``str``
+
+    The wrapper is safe to feed from multiple observer threads at once.
+    :meth:`stop` flushes every event still queued: queued events are
+    delivered before :meth:`stop` returns, and no callback is invoked
+    afterwards.  Events dispatched after :meth:`stop` are dropped.
+    """
+
+    def __init__(self, handler: FileSystemEventHandler, delay: float = 0.2, mode: str = "last") -> None:
+        if mode not in ("first", "last"):
+            error = f"mode must be 'first' or 'last', got {mode!r}"
+            raise ValueError(error)
+        if delay < 0:
+            error = f"delay must be >= 0, got {delay!r}"
+            raise ValueError(error)
+        super().__init__()
+        self._handler = handler
+        self._delay = float(delay)
+        self._mode = mode
+        self._cond = threading.Condition()
+        self._dispatch_lock = threading.RLock()
+        self._pending: dict[tuple[str, bool, bytes | str, bytes | str], list[FileSystemEvent | float]] = {}
+        self._thread: threading.Thread | None = None
+        self._stopped = False
+
+    def start(self) -> None:
+        """Starts the debounce thread.
+
+        Called automatically on the first dispatched event, so explicit use
+        is optional.  Idempotent; a no-op once stopped or when ``delay`` is 0.
+        """
+        if self._delay <= 0:
+            return
+        with self._cond:
+            if not self._stopped:
+                self._ensure_thread()
+
+    def stop(self) -> None:
+        """Stops the debounce thread, flushing queued events first.
+
+        Every event still waiting in the debounce window is delivered to the
+        wrapped handler before this method returns.  Once it has returned, no
+        further callback is invoked, and events dispatched afterwards are
+        dropped.
+        """
+        with self._cond:
+            self._stopped = True
+            pending = [event for event, _ in self._pending.values()]
+            self._pending.clear()
+            self._cond.notify_all()
+        # Serialize with an in-flight dispatch from the debounce thread so
+        # that no callback is still running when this method returns.
+        with self._dispatch_lock:
+            for event in pending:
+                self._handler.dispatch(event)
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join()
+
+    def dispatch(self, event: FileSystemEvent) -> None:
+        """Dispatches events to the wrapped handler, debounced per event group.
+
+        :param event:
+            The event object representing the file system event.
+        :type event:
+            :class:`FileSystemEvent`
+        """
+        if self._delay <= 0:
+            self._handler.dispatch(event)
+            return
+        key = (event.event_type, event.is_directory, event.src_path, event.dest_path)
+        with self._cond:
+            if self._stopped:
+                return
+            self._ensure_thread()
+            deadline = time.monotonic() + self._delay
+            entry = self._pending.get(key)
+            if entry is None or self._mode == "last":
+                self._pending[key] = [event, deadline]
+            else:
+                entry[1] = deadline
+            self._cond.notify_all()
+
+    def _ensure_thread(self) -> None:
+        if self._thread is None:
+            self._thread = threading.Thread(target=self._run, name="watchdog.debounced-events", daemon=True)
+            self._thread.start()
+
+    def _run(self) -> None:
+        while True:
+            with self._dispatch_lock:
+                with self._cond:
+                    if self._stopped:
+                        return
+                    now = time.monotonic()
+                    due = [key for key, (_, deadline) in self._pending.items() if deadline <= now]
+                    events = [self._pending.pop(key)[0] for key in due]
+                    if not events:
+                        timeout = None
+                        if self._pending:
+                            timeout = max(0.0, min(deadline for _, deadline in self._pending.values()) - now)
+                        self._cond.wait(timeout)
+                        continue
+                for event in events:
+                    self._handler.dispatch(event)
 
 
 def generate_sub_moved_events(
