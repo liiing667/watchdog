@@ -77,6 +77,10 @@ Event Handler Classes
    :members:
    :show-inheritance:
 
+.. autoclass:: DebouncedEventHandler
+   :members:
+   :show-inheritance:
+
 """
 
 from __future__ import annotations
@@ -84,6 +88,7 @@ from __future__ import annotations
 import logging
 import os.path
 import re
+import threading
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
@@ -91,6 +96,7 @@ from watchdog.utils.patterns import match_any_paths
 
 if TYPE_CHECKING:
     from collections.abc import Generator
+    from typing import Literal
 
 EVENT_TYPE_MOVED = "moved"
 EVENT_TYPE_DELETED = "deleted"
@@ -509,6 +515,135 @@ class LoggingEventHandler(FileSystemEventHandler):
         super().on_opened(event)
 
         self.logger.info("Opened file: %s", event.src_path)
+
+
+class DebouncedEventHandler(FileSystemEventHandler):
+    """Wraps another event handler and coalesces bursts of duplicate events.
+
+    Events that share the same event type, directory flag and path(s), and
+    that arrive within ``delay`` seconds of each other, are collapsed into a
+    single event. The surviving event is forwarded to the wrapped handler
+    once no further event for that key has been seen for ``delay`` seconds
+    (the quiet period restarts on every new event for the key).
+
+    File events and directory events are coalesced independently, and moved
+    events are keyed on both ``src_path`` and ``dest_path``, so a move is
+    never merged with an event for a different path pair.
+
+    The wrapper is safe to feed from multiple observer threads
+    concurrently. ``delay=0`` disables debouncing and forwards every event
+    immediately.
+
+    :param handler:
+        The wrapped handler receiving the coalesced events.
+    :type handler:
+        :class:`watchdog.events.FileSystemEventHandler`
+    :param delay:
+        The quiet period, in seconds, after which a pending event is
+        forwarded. ``0`` forwards events immediately.
+    :type delay:
+        ``float``
+    :param mode:
+        ``"last"`` (default) forwards the most recent event of a burst,
+        ``"first"`` forwards the first one.
+    :type mode:
+        ``str``
+    """
+
+    def __init__(
+        self,
+        handler: FileSystemEventHandler,
+        delay: float = 0.2,
+        mode: Literal["first", "last"] = "last",
+    ) -> None:
+        super().__init__()
+        if mode not in ("first", "last"):
+            error = f"mode must be first or last, got {mode!r}"
+            raise ValueError(error)
+        self._handler = handler
+        self._delay = float(delay)
+        self._mode = mode
+        self._lock = threading.Lock()
+        self._deliver_lock = threading.Lock()
+        self._pending: dict[tuple[str, bool, bytes | str, bytes | str], tuple[FileSystemEvent, threading.Timer]] = {}
+        self._stopped = False
+
+    @staticmethod
+    def _key(event: FileSystemEvent) -> tuple[str, bool, bytes | str, bytes | str]:
+        return (event.event_type, event.is_directory, event.src_path, event.dest_path)
+
+    def dispatch(self, event: FileSystemEvent) -> None:
+        """Coalesces the event and forwards it to the wrapped handler once
+        the quiet period has passed.
+
+        :param event:
+            The event object representing the file system event.
+        :type event:
+            :class:`watchdog.events.FileSystemEvent`
+        """
+        if self._delay <= 0:
+            with self._lock:
+                stopped = self._stopped
+            if not stopped:
+                self._handler.dispatch(event)
+            return
+
+        key = self._key(event)
+        with self._lock:
+            if self._stopped:
+                return
+            entry = self._pending.get(key)
+            if entry is not None:
+                entry[1].cancel()
+                kept = event if self._mode == "last" else entry[0]
+            else:
+                kept = event
+            timer = threading.Timer(self._delay, self._expire, args=(key,))
+            timer.daemon = True
+            self._pending[key] = (kept, timer)
+            timer.start()
+
+    def _expire(self, key: tuple[str, bool, bytes | str, bytes | str]) -> None:
+        # Serialize with stop(): whichever acquires _deliver_lock first wins,
+        # so a queued event is delivered exactly once, either here or by stop().
+        with self._deliver_lock:
+            with self._lock:
+                if self._stopped:
+                    return
+                entry = self._pending.pop(key, None)
+                if entry is None:
+                    return
+            self._handler.dispatch(entry[0])
+
+    def start(self) -> None:
+        """(Re-)enables forwarding of events after a :meth:`stop`."""
+        with self._lock:
+            self._stopped = False
+
+    def stop(self) -> None:
+        """Stops the wrapper, flushing all queued events synchronously.
+
+        Every event still pending when this method is called is delivered to
+        the wrapped handler exactly once before this method returns, and any
+        delivery already in progress is awaited. After this method returns,
+        no further callbacks into the wrapped handler will happen; events
+        dispatched afterwards are dropped.
+        """
+        with self._deliver_lock:
+            with self._lock:
+                self._stopped = True
+                pending = list(self._pending.values())
+                self._pending.clear()
+            for event, timer in pending:
+                timer.cancel()
+                self._handler.dispatch(event)
+
+    def __enter__(self) -> DebouncedEventHandler:
+        self.start()
+        return self
+
+    def __exit__(self, *args: object) -> None:
+        self.stop()
 
 
 def generate_sub_moved_events(
